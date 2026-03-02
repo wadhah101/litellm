@@ -12,10 +12,13 @@ import json
 
 # s/o [@Frank Colson](https://www.linkedin.com/in/frank-colson-422b9b183/) for this redis implementation
 import os
-from typing import Callable, List, Optional, Union
+import threading
+import time
+from typing import Callable, List, Optional, Tuple, Union
 
 import redis  # type: ignore
 import redis.asyncio as async_redis  # type: ignore
+from redis.credentials import CredentialProvider
 
 from litellm import get_secret, get_secret_str
 from litellm.constants import REDIS_CONNECTION_POOL_TIMEOUT, REDIS_SOCKET_TIMEOUT
@@ -53,7 +56,7 @@ def _get_redis_url_kwargs(client=None):
         "retry",
     }
 
-    include_args = ["url"]
+    include_args = ["url", "credential_provider"]
 
     available_args = [x for x in arg_spec.args if x not in exclude_args] + include_args
 
@@ -78,6 +81,7 @@ def _get_redis_cluster_kwargs(client=None):
     available_args.append("redis_connect_func")  # Needed for sync clusters and IAM detection
     available_args.append("gcp_service_account")
     available_args.append("gcp_ssl_ca_certs")
+    available_args.append("credential_provider")
     available_args.append("max_connections")
 
     return available_args
@@ -125,6 +129,55 @@ def _generate_gcp_iam_access_token(service_account: str) -> str:
     )
     response = client.generate_access_token(request=request)
     return str(response.access_token)
+
+
+class GCPIAMCredentialProvider(CredentialProvider):
+    """
+    Redis CredentialProvider that authenticates using GCP IAM access tokens.
+
+    Tokens are cached and automatically refreshed when the TTL expires,
+    ensuring long-lived Redis clients never use stale credentials.
+    """
+
+    def __init__(
+        self,
+        service_account: str,
+        token_cache_ttl_seconds: int = 3300,  # 55 min, well before 60 min expiry
+    ):
+        self._service_account = service_account
+        self._token_cache_ttl_seconds = token_cache_ttl_seconds
+        self._lock = threading.Lock()
+        self._cached_token: Optional[str] = None
+        self._token_expiry: float = 0.0  # monotonic timestamp
+
+    def _get_or_refresh_token(self) -> str:
+        """Thread-safe double-checked locking for token refresh."""
+        now = time.monotonic()
+        if self._cached_token is not None and now < self._token_expiry:
+            return self._cached_token
+
+        with self._lock:
+            # Double-check after acquiring lock
+            now = time.monotonic()
+            if self._cached_token is not None and now < self._token_expiry:
+                return self._cached_token
+
+            verbose_logger.debug(
+                "GCPIAMCredentialProvider: refreshing GCP IAM access token"
+            )
+            self._cached_token = _generate_gcp_iam_access_token(
+                self._service_account
+            )
+            self._token_expiry = now + self._token_cache_ttl_seconds
+            return self._cached_token
+
+    def get_credentials(self) -> Tuple[str]:
+        """Return (token,) tuple for password-only AUTH."""
+        return (self._get_or_refresh_token(),)
+
+    async def get_credentials_async(self) -> Tuple[str]:
+        """Async variant — delegates to sync since the IAM call is cached."""
+        return self.get_credentials()
 
 
 def create_gcp_iam_redis_connect_func(
@@ -243,21 +296,18 @@ def _get_redis_client_logic(**env_overrides):
     # Handle GCP IAM authentication
     _gcp_service_account = redis_kwargs.get("gcp_service_account") or get_secret_str("REDIS_GCP_SERVICE_ACCOUNT")
     _gcp_ssl_ca_certs = redis_kwargs.get("gcp_ssl_ca_certs") or get_secret_str("REDIS_GCP_SSL_CA_CERTS")
-    
+
     if _gcp_service_account is not None:
         verbose_logger.debug("Setting up GCP IAM authentication for Redis with service account.")
-        redis_kwargs["redis_connect_func"] = create_gcp_iam_redis_connect_func(
+        redis_kwargs["credential_provider"] = GCPIAMCredentialProvider(
             service_account=_gcp_service_account,
-            ssl_ca_certs=_gcp_ssl_ca_certs
         )
-        # Store GCP service account in redis_connect_func for async cluster access
-        redis_kwargs["redis_connect_func"]._gcp_service_account = _gcp_service_account
-        
-        # Remove GCP-specific kwargs that shouldn't be passed to Redis client
+        # credential_provider conflicts with password/username in redis-py
+        redis_kwargs.pop("password", None)
+        redis_kwargs.pop("username", None)
         redis_kwargs.pop("gcp_service_account", None)
         redis_kwargs.pop("gcp_ssl_ca_certs", None)
-        
-        # Only enable SSL if explicitly requested AND SSL CA certs are provided
+        # SSL CA certs still needed if configured
         if _gcp_ssl_ca_certs and redis_kwargs.get("ssl", False):
             redis_kwargs["ssl_ca_certs"] = _gcp_ssl_ca_certs
 
@@ -405,46 +455,18 @@ def get_redis_async_client(
             if arg in args:
                 cluster_kwargs[arg] = redis_kwargs[arg]
 
-        # Handle GCP IAM authentication for async clusters
-        redis_connect_func = cluster_kwargs.pop("redis_connect_func", None)
-        from litellm import get_secret_str
+        # redis_connect_func is not supported by async RedisCluster
+        cluster_kwargs.pop("redis_connect_func", None)
 
-        # Get GCP service account - first try from redis_connect_func, then from environment
-        gcp_service_account = None
-        if redis_connect_func and hasattr(redis_connect_func, '_gcp_service_account'):
-            gcp_service_account = redis_connect_func._gcp_service_account
-        else:
-            gcp_service_account = redis_kwargs.get("gcp_service_account") or get_secret_str("REDIS_GCP_SERVICE_ACCOUNT")
-        
-        verbose_logger.debug(f"DEBUG: Redis cluster kwargs: redis_connect_func={redis_connect_func is not None}, gcp_service_account_provided={gcp_service_account is not None}")
-        
-        # If GCP IAM is configured (indicated by redis_connect_func), generate access token and use as password
-        if redis_connect_func and gcp_service_account:
-            verbose_logger.debug("DEBUG: Generating IAM token for service account (value not logged for security reasons)")
-            try:
-                # Generate IAM access token using the helper function
-                access_token = _generate_gcp_iam_access_token(gcp_service_account)
-                cluster_kwargs["password"] = access_token
-                verbose_logger.debug("DEBUG: Successfully generated GCP IAM access token for async Redis cluster")
-            except Exception as e:
-                verbose_logger.error(f"Failed to generate GCP IAM access token: {e}")
-                from redis.exceptions import AuthenticationError
-                raise AuthenticationError("Failed to generate GCP IAM access token")
-        else:
-            verbose_logger.debug(f"DEBUG: Not using GCP IAM auth - redis_connect_func={redis_connect_func is not None}, gcp_service_account_provided={gcp_service_account is not None}")
-        
         new_startup_nodes: List[ClusterNode] = []
 
         for item in redis_kwargs["startup_nodes"]:
             new_startup_nodes.append(ClusterNode(**item))
         cluster_kwargs.pop("startup_nodes", None)
-        
-        # Create async RedisCluster with IAM token as password if available
-        cluster_client = async_redis.RedisCluster(
+
+        return async_redis.RedisCluster(
             startup_nodes=new_startup_nodes, **cluster_kwargs  # type: ignore
         )
-            
-        return cluster_client
 
     # Check for Redis Sentinel
     if "sentinel_nodes" in redis_kwargs and "service_name" in redis_kwargs:
@@ -472,6 +494,8 @@ def get_redis_connection_pool(**env_overrides):
                     "REDIS: invalid max_connections value %r, ignoring",
                     redis_kwargs["max_connections"],
                 )
+        if "credential_provider" in redis_kwargs:
+            pool_kwargs["credential_provider"] = redis_kwargs["credential_provider"]
         return async_redis.BlockingConnectionPool.from_url(**pool_kwargs)
     connection_class = async_redis.Connection
     if "ssl" in redis_kwargs:

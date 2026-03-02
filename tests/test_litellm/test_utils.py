@@ -2602,6 +2602,175 @@ def test_generate_gcp_iam_access_token_import_error():
         assert "pip install google-cloud-iam" in str(exc_info.value)
 
 
+def test_gcp_iam_credential_provider_get_credentials():
+    """
+    Test that GCPIAMCredentialProvider.get_credentials() returns a (token,) tuple.
+    """
+    from unittest.mock import Mock, patch
+
+    mock_response = Mock()
+    mock_response.access_token = "test-token-abc"
+    mock_client = Mock()
+    mock_client.generate_access_token.return_value = mock_response
+    mock_iam = Mock()
+    mock_iam.IAMCredentialsClient = Mock(return_value=mock_client)
+    mock_iam.GenerateAccessTokenRequest = Mock()
+
+    with patch.dict("sys.modules", {"google.cloud.iam_credentials_v1": mock_iam}):
+        from litellm._redis import GCPIAMCredentialProvider
+
+        provider = GCPIAMCredentialProvider(
+            service_account="projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com"
+        )
+        creds = provider.get_credentials()
+        assert creds == ("test-token-abc",)
+
+
+def test_gcp_iam_credential_provider_caches_token():
+    """
+    Test that a second call within TTL reuses the cached token (no second IAM call).
+    """
+    from unittest.mock import Mock, patch
+
+    mock_response = Mock()
+    mock_response.access_token = "cached-token"
+    mock_client = Mock()
+    mock_client.generate_access_token.return_value = mock_response
+    mock_iam = Mock()
+    mock_iam.IAMCredentialsClient = Mock(return_value=mock_client)
+    mock_iam.GenerateAccessTokenRequest = Mock()
+
+    with patch.dict("sys.modules", {"google.cloud.iam_credentials_v1": mock_iam}):
+        from litellm._redis import GCPIAMCredentialProvider
+
+        provider = GCPIAMCredentialProvider(
+            service_account="projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com",
+            token_cache_ttl_seconds=3600,
+        )
+
+        first = provider.get_credentials()
+        second = provider.get_credentials()
+
+        assert first == second == ("cached-token",)
+        # IAMCredentialsClient should only have been instantiated once
+        assert mock_client.generate_access_token.call_count == 1
+
+
+def test_gcp_iam_credential_provider_refreshes_after_ttl():
+    """
+    Test that the token is regenerated after the TTL expires.
+    """
+    import time as _time
+    from unittest.mock import Mock, call, patch
+
+    mock_response_1 = Mock()
+    mock_response_1.access_token = "token-1"
+    mock_response_2 = Mock()
+    mock_response_2.access_token = "token-2"
+    mock_client = Mock()
+    mock_client.generate_access_token.side_effect = [mock_response_1, mock_response_2]
+    mock_iam = Mock()
+    mock_iam.IAMCredentialsClient = Mock(return_value=mock_client)
+    mock_iam.GenerateAccessTokenRequest = Mock()
+
+    with patch.dict("sys.modules", {"google.cloud.iam_credentials_v1": mock_iam}):
+        from litellm._redis import GCPIAMCredentialProvider
+
+        provider = GCPIAMCredentialProvider(
+            service_account="projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com",
+            token_cache_ttl_seconds=10,
+        )
+
+        first = provider.get_credentials()
+        assert first == ("token-1",)
+
+        # Simulate TTL expiry by rewinding the expiry timestamp
+        provider._token_expiry = _time.monotonic() - 1
+
+        second = provider.get_credentials()
+        assert second == ("token-2",)
+        assert mock_client.generate_access_token.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_gcp_iam_credential_provider_async():
+    """
+    Test that get_credentials_async() returns the same result as get_credentials().
+    """
+    from unittest.mock import Mock, patch
+
+    mock_response = Mock()
+    mock_response.access_token = "async-token"
+    mock_client = Mock()
+    mock_client.generate_access_token.return_value = mock_response
+    mock_iam = Mock()
+    mock_iam.IAMCredentialsClient = Mock(return_value=mock_client)
+    mock_iam.GenerateAccessTokenRequest = Mock()
+
+    with patch.dict("sys.modules", {"google.cloud.iam_credentials_v1": mock_iam}):
+        from litellm._redis import GCPIAMCredentialProvider
+
+        provider = GCPIAMCredentialProvider(
+            service_account="projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com"
+        )
+        creds = await provider.get_credentials_async()
+        assert creds == ("async-token",)
+
+
+def test_get_redis_client_logic_sets_credential_provider_for_gcp(monkeypatch):
+    """
+    Test that _get_redis_client_logic sets credential_provider and removes password/redis_connect_func
+    when gcp_service_account is provided.
+    """
+    monkeypatch.delenv("REDIS_HOST", raising=False)
+    monkeypatch.delenv("REDIS_PORT", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_NODES", raising=False)
+    monkeypatch.delenv("REDIS_GCP_SERVICE_ACCOUNT", raising=False)
+    monkeypatch.delenv("REDIS_GCP_SSL_CA_CERTS", raising=False)
+
+    from litellm._redis import GCPIAMCredentialProvider, _get_redis_client_logic
+
+    result = _get_redis_client_logic(
+        host="redis.example.com",
+        port=6379,
+        password="old-pass",
+        gcp_service_account="projects/-/serviceAccounts/sa@proj.iam.gserviceaccount.com",
+    )
+
+    assert isinstance(result.get("credential_provider"), GCPIAMCredentialProvider)
+    assert "password" not in result
+    assert "redis_connect_func" not in result
+    assert "gcp_service_account" not in result
+    assert "gcp_ssl_ca_certs" not in result
+
+
+def test_get_redis_client_logic_no_gcp_unchanged(monkeypatch):
+    """
+    Test that non-GCP configs are unaffected — no credential_provider is set.
+    """
+    monkeypatch.delenv("REDIS_HOST", raising=False)
+    monkeypatch.delenv("REDIS_PORT", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_NODES", raising=False)
+    monkeypatch.delenv("REDIS_GCP_SERVICE_ACCOUNT", raising=False)
+    monkeypatch.delenv("REDIS_GCP_SSL_CA_CERTS", raising=False)
+
+    from litellm._redis import _get_redis_client_logic
+
+    result = _get_redis_client_logic(
+        host="redis.example.com",
+        port=6379,
+        password="my-password",
+    )
+
+    assert "credential_provider" not in result
+    assert result.get("password") == "my-password"
+    assert result.get("host") == "redis.example.com"
+
+
 if __name__ == "__main__":
     # Allow running this test file directly for debugging
     pytest.main([__file__, "-v"])
